@@ -13,6 +13,89 @@
 #define UART_CLK_FREQ	(26000000 * 2)
 #endif
 
+static uint32 get_rom_addr(uint32 * readpos, uint8 * sectcount) {
+
+	uint8 buffer[BUFFER_SIZE];
+	uint32 romaddr;
+
+	rom_header_new *header = (rom_header_new*)buffer;
+	section_header *section = (section_header*)buffer;
+
+	if (*readpos == 0 || *readpos == 0xffffffff) {
+		ets_printf("Err a\n");
+		return 0;
+	}
+
+	// read rom header
+	if (SPIRead(*readpos, header, sizeof(rom_header_new)) != 0) {
+		ets_printf("Err b\n");
+		return 0;
+	}
+
+	// check header type
+	if (header->magic == ROM_MAGIC) {
+		// old type, no extra header or irom section to skip over
+		romaddr = *readpos;
+		*readpos += sizeof(rom_header);
+		*sectcount = header->count;
+	} else if (header->magic == ROM_MAGIC_NEW1 && header->count == ROM_MAGIC_NEW2) {
+		// new type, has extra header and irom section first
+		romaddr = *readpos + header->len + sizeof(rom_header_new);
+#ifdef BOOT_IROM_CHKSUM
+		// we will set the real section count later, when we read the header
+		*sectcount = 0xff;
+		// just skip the first part of the header
+		// rest is processed for the chksum
+		*readpos += sizeof(rom_header);
+#else
+		// skip the extra header and irom section
+		*readpos = romaddr;
+		// read the normal header that follows
+		if (SPIRead(*readpos, header, sizeof(rom_header)) != 0) {
+			ets_printf("Err c\n");
+			return 0;
+		}
+		*sectcount = header->count;
+		*readpos += sizeof(rom_header);
+#endif
+	} else {
+		ets_printf("Err d\n");
+		return 0;
+	}
+	return romaddr;
+}
+
+static uint8 move_rom_to_pos_0(uint32 readpos) {
+	uint32 readposCopy = readpos;
+	uint8 buffer[BUFFER_SIZE];
+	uint8 sectcount;
+	uint32 romaddr = get_rom_addr(&readpos, &sectcount);
+
+	ets_printf("Was\n");
+	uint32 romSize = sectcount * SECTOR_SIZE;
+	uint32 newRomAddr = (BOOT_CONFIG_SECTOR + 1) * SECTOR_SIZE;
+	// uint32 end = romSize + newRomAddr;
+	uint32 end = readposCopy + 300000;
+	ets_printf("Loop at %d copy of %d till %d\n", newRomAddr, readposCopy, end);
+	for (; readposCopy < end; newRomAddr += BUFFER_SIZE, readposCopy += BUFFER_SIZE) {
+		// ets_printf("Yoyo\n");
+		ets_printf("Write at %d from %d\n", newRomAddr, readposCopy);
+		if (SPIRead(readposCopy, buffer, BUFFER_SIZE) != 0) {
+			ets_printf("read err %d\n", readposCopy);
+			return 2;
+		}
+		ets_printf("Erase %d %d\n", newRomAddr % SECTOR_SIZE == 0, newRomAddr);
+		if (newRomAddr % SECTOR_SIZE == 0 && SPIEraseSector(newRomAddr / SECTOR_SIZE) != 0) {
+			ets_printf("erase err\n");
+			return 3;
+		}
+		ets_printf("Write\n");
+		SPIWrite(newRomAddr, buffer, BUFFER_SIZE);
+	}
+	ets_delay_us(999999);
+	return 0;
+}
+
 static uint32 check_image(uint32 readpos) {
 
 	uint8 buffer[BUFFER_SIZE];
@@ -26,49 +109,14 @@ static uint32 check_image(uint32 readpos) {
 	rom_header_new *header = (rom_header_new*)buffer;
 	section_header *section = (section_header*)buffer;
 
-	if (readpos == 0 || readpos == 0xffffffff) {
-		return 0;
-	}
-
-	// read rom header
-	if (SPIRead(readpos, header, sizeof(rom_header_new)) != 0) {
-		return 0;
-	}
-
-	// check header type
-	if (header->magic == ROM_MAGIC) {
-		// old type, no extra header or irom section to skip over
-		romaddr = readpos;
-		readpos += sizeof(rom_header);
-		sectcount = header->count;
-	} else if (header->magic == ROM_MAGIC_NEW1 && header->count == ROM_MAGIC_NEW2) {
-		// new type, has extra header and irom section first
-		romaddr = readpos + header->len + sizeof(rom_header_new);
-#ifdef BOOT_IROM_CHKSUM
-		// we will set the real section count later, when we read the header
-		sectcount = 0xff;
-		// just skip the first part of the header
-		// rest is processed for the chksum
-		readpos += sizeof(rom_header);
-#else
-		// skip the extra header and irom section
-		readpos = romaddr;
-		// read the normal header that follows
-		if (SPIRead(readpos, header, sizeof(rom_header)) != 0) {
-			return 0;
-		}
-		sectcount = header->count;
-		readpos += sizeof(rom_header);
-#endif
-	} else {
-		return 0;
-	}
+	romaddr = get_rom_addr(&readpos, &sectcount);
 
 	// test each section
 	for (sectcurrent = 0; sectcurrent < sectcount; sectcurrent++) {
 
 		// read section header
 		if (SPIRead(readpos, section, sizeof(section_header)) != 0) {
+			ets_printf("Err 1\n");
 			return 0;
 		}
 		readpos += sizeof(section_header);
@@ -81,6 +129,7 @@ static uint32 check_image(uint32 readpos) {
 			uint32 readlen = (remaining < BUFFER_SIZE) ? remaining : BUFFER_SIZE;
 			// read the block
 			if (SPIRead(readpos, buffer, readlen) != 0) {
+				ets_printf("Err 2\n");
 				return 0;
 			}
 			// increment next read position
@@ -98,6 +147,7 @@ static uint32 check_image(uint32 readpos) {
 			// just processed the irom section, now
 			// read the normal header that follows
 			if (SPIRead(readpos, header, sizeof(rom_header)) != 0) {
+				ets_printf("Err 3\n");
 				return 0;
 			}
 			sectcount = header->count + 1;
@@ -109,11 +159,13 @@ static uint32 check_image(uint32 readpos) {
 	// round up to next 16 and get checksum
 	readpos = readpos | 0x0f;
 	if (SPIRead(readpos, buffer, 1) != 0) {
+		ets_printf("Err 4\n");
 		return 0;
 	}
 
 	// compare calculated and stored checksums
 	if (buffer[0] != chksum) {
+		ets_printf("Err 5\n");
 		return 0;
 	}
 
@@ -487,6 +539,14 @@ uint32 NOINLINE find_image(void) {
 		return 0;
 	}
 #endif
+
+	if (runAddr != 0 && romToBoot > 0) {
+		ets_printf("rom to boot %d at %d. Let move it to 0x2000\r\n", romToBoot, romconf->roms[romToBoot]);
+		move_rom_to_pos_0(romconf->roms[romToBoot]);
+		romToBoot = 0;
+		updateConfig = TRUE;
+		runAddr = check_image(romconf->roms[romToBoot]);
+	}
 
 	// check we have a good rom
 	while (runAddr == 0) {
