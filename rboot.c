@@ -120,6 +120,41 @@ static uint32 check_image(uint32 readpos) {
 	return romaddr;
 }
 
+uint8 move_rom_to_pos_0(uint32 readpos) {
+	uint8 buffer[BUFFER_SIZE];
+	uint8 buf[SECTOR_SIZE];
+	uint8 sectcount;
+	uint8 sectcurrent;
+	uint32 romaddr;
+
+
+	rom_header_new *header = (rom_header_new*)buffer;
+
+	// read rom header
+	if (SPIRead(readpos, header, sizeof(rom_header_new)) != 0) {
+		return 1;
+	}
+
+	sectcount = header->count;
+	readpos += sizeof(rom_header);
+
+	uint32 bytes = readpos - ((BOOT_CONFIG_SECTOR + 1) * SECTOR_SIZE);
+	for (sectcurrent = 0; sectcurrent < sectcount; sectcurrent++) {
+		ets_printf("Write at %d sect %d\n", readpos - bytes, sectcurrent+BOOT_CONFIG_SECTOR+1);
+		if (SPIRead(readpos, buf, SECTOR_SIZE) != 0) {
+			ets_printf("read err %d\n", readpos);
+			return 2;
+		}
+		if(SPIEraseSector(sectcurrent+BOOT_CONFIG_SECTOR+1) != 0) {
+			ets_printf("erase err\n");
+			return 3;
+		}
+		SPIWrite(readpos - bytes, buf, SECTOR_SIZE);
+		readpos += SECTOR_SIZE;
+	}
+	return 0;
+}
+
 #if defined (BOOT_GPIO_ENABLED) || defined(BOOT_GPIO_SKIP_ENABLED)
 
 #if BOOT_GPIO_NUM > 16
@@ -502,6 +537,12 @@ uint32 NOINLINE find_image(void) {
 			return 0;
 		}
 		runAddr = check_image(romconf->roms[romToBoot]);
+	}
+
+	// here
+	if (romToBoot > 0 && move_rom_to_pos_0(romconf->roms[romToBoot]) == 0) {
+		romToBoot = 0;
+		updateConfig = TRUE;
 	}
 
 	// re-write config, if required
